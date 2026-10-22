@@ -39,20 +39,19 @@ jobs:
       - name: Build IPA from NSP
         working-directory: ./nxnative
         run: |
-          # Build the shader translator first so its binary exists
+          # 1. Build the shader translator binary
           dotnet publish dm/gfx/tools/dmsh_xlate/dmsh_xlate.csproj -c Release -r osx-arm64 --self-contained -o dm/gfx/tools/dmsh_xlate_bin
 
-          # Update dmsh_chain.lock to trust the runner's newly built translator and spirv-cross
-          python3 dm/gfx/tools/dmsh_chain.py --update-lock
-
-          # Refresh the chain header for all game profiles so the host and shaders match
+          # 2. Update the global lock file (passing a valid DM_GAME so dmsh_chain.py initializes) and refresh each game's chain header
+          DM_GAME=0100000000010000 python3 dm/gfx/tools/dmsh_chain.py --update-lock
           for g in dm/games/0100*; do
             if [ -d "$g" ]; then
-              DM_GAME=$(basename "$g") python3 dm/gfx/tools/dmsh_chain.py --header
+              DM_GAME=$(basename "$g") python3 dm/gfx/tools/dmsh_chain.py --update-lock
+              DM_GAME=$(basename "$g") python3 dm/gfx/tools/dmsh_chain.py --header || true
             fi
           done
 
-          # Run the main IPA packer (and print the log if an error occurs)
+          # 3. Run the main IPA packer (and print the log if an error occurs)
           python3 scripts/build_ipa_from_nsp.py ~/Games/TargetGame -k ~/keys/prod.keys || {
             echo "=== DMSH BUILD LOG ==="
             cat ~/Games/TargetGame/*_build/logs/*.log || true
