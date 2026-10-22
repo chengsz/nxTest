@@ -2,11 +2,16 @@ name: Build nxnative IPA
 
 on:
   workflow_dispatch:
+    inputs:
+      game_id:
+        description: 'Game Title ID (e.g. 0100000000010000)'
+        required: true
+        default: '0100000000010000'
 
 jobs:
   build-ipa:
     runs-on: macos-15
-    timeout-minutes: 120
+    timeout-minutes: 360 # Maximized to 6 hours to prevent long shader builds from cutting off
 
     steps:
       - name: Free Up Runner Disk Space for Large NSPs
@@ -17,6 +22,16 @@ jobs:
 
       - name: Clone nxnative
         run: git clone https://github.com/seedds/nxnative.git
+
+      - name: Cache Build and Shaders
+        uses: actions/cache@v4
+        with:
+          path: |
+            nxnative/dm/games/${{ github.event.inputs.game_id }}*_build
+            ~/.nuget/packages
+          key: nxnative-build-${{ github.event.inputs.game_id }}-${{ hashFiles('nxnative/dm/games/${{ github.event.inputs.game_id }}*') }}
+          restore-keys: |
+            nxnative-build-${{ github.event.inputs.game_id }}-
 
       - name: Install Homebrew & Python Dependencies
         run: |
@@ -34,16 +49,13 @@ jobs:
           unzip -j ~/nsp.zip -d ~/Games/TargetGame
           rm ~/nsp.zip
           curl -fL "$KEYS_URL" -o ~/keys/prod.keys
-          ls -lh ~/Games/TargetGame ~/keys
 
       - name: Build IPA from NSP
         working-directory: ./nxnative
         run: |
-          # 1. Build the shader translator binary
           dotnet publish dm/gfx/tools/dmsh_xlate/dmsh_xlate.csproj -c Release -r osx-arm64 --self-contained -o dm/gfx/tools/dmsh_xlate_bin
 
-          # 2. Update the global lock file (passing a valid DM_GAME so dmsh_chain.py initializes) and refresh each game's chain header
-          DM_GAME=0100000000010000 python3 dm/gfx/tools/dmsh_chain.py --update-lock
+          DM_GAME=${{ github.event.inputs.game_id }} python3 dm/gfx/tools/dmsh_chain.py --update-lock
           for g in dm/games/0100*; do
             if [ -d "$g" ]; then
               DM_GAME=$(basename "$g") python3 dm/gfx/tools/dmsh_chain.py --update-lock
@@ -51,8 +63,14 @@ jobs:
             fi
           done
 
-          # 3. Run the main IPA packer (and print the log if an error occurs)
-          python3 scripts/build_ipa_from_nsp.py ~/Games/TargetGame -k ~/keys/prod.keys || {
+          # Run build with a keep-alive background ping so GitHub never times out due to lack of log activity
+          python3 scripts/build_ipa_from_nsp.py ~/Games/TargetGame -k ~/keys/prod.keys &
+          BUILD_PID=$!
+          while kill -0 $BUILD_PID 2>/dev/null; do
+            echo "Still compiling shaders..."
+            sleep 60
+          done
+          wait $BUILD_PID || {
             echo "=== DMSH BUILD LOG ==="
             cat ~/Games/TargetGame/*_build/logs/*.log || true
             exit 1
