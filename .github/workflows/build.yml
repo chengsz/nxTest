@@ -11,20 +11,21 @@ on:
 jobs:
   build-ipa:
     runs-on: macos-15
-    timeout-minutes: 360 # Maximized to 6 hours to prevent long shader builds from cutting off
+    timeout-minutes: 360
 
     steps:
-      - name: Free Up Runner Disk Space for Large NSPs
+      - name: Maximize Runner Disk Space
         run: |
           sudo rm -rf /Library/Developer/CommandLineTools
           sudo rm -rf /Users/runner/Library/Android
+          sudo rm -rf /Users/runner/hostedtoolcache
           df -h
 
       - name: Clone nxnative
         run: git clone https://github.com/seedds/nxnative.git
 
-      - name: Cache Build and Shaders
-        uses: actions/cache@v4
+      - name: Restore Cache (Shaders)
+        uses: actions/cache/restore@v4
         with:
           path: |
             nxnative/dm/games/${{ github.event.inputs.game_id }}*_build
@@ -63,20 +64,19 @@ jobs:
             fi
           done
 
-          # Run build with a keep-alive background ping so GitHub never times out due to lack of log activity
-          python3 scripts/build_ipa_from_nsp.py ~/Games/TargetGame -k ~/keys/prod.keys &
-          BUILD_PID=$!
-          while kill -0 $BUILD_PID 2>/dev/null; do
-            echo "Still compiling shaders..."
-            sleep 60
-          done
-          wait $BUILD_PID || {
-            echo "=== DMSH BUILD LOG ==="
-            cat ~/Games/TargetGame/*_build/logs/*.log || true
-            exit 1
-          }
+          python3 scripts/build_ipa_from_nsp.py ~/Games/TargetGame -k ~/keys/prod.keys
+
+      - name: Force Save Cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            nxnative/dm/games/${{ github.event.inputs.game_id }}*_build
+            ~/.nuget/packages
+          key: nxnative-build-${{ github.event.inputs.game_id }}-${{ github.run_id }}
 
       - name: Upload Finished IPA Back to Oracle Cloud
+        if: success()
         env:
           UPLOAD_URL: ${{ secrets.OCI_UPLOAD_URL }}
         run: |
