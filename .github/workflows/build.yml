@@ -1,0 +1,54 @@
+YAML
+
+name: Build nxnative IPA
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-ipa:
+    runs-on: macos-15
+    timeout-minutes: 120
+
+    steps:
+      - name: Free Up Runner Disk Space for Large NSPs
+        run: |
+          sudo rm -rf /Library/Developer/CommandLineTools
+          sudo rm -rf /Users/runner/Library/Android
+          df -h
+
+      - name: Clone nxnative
+        run: git clone https://github.com/seedds/nxnative.git
+
+      - name: Install Homebrew & Python Dependencies
+        run: |
+          brew install xcodegen zstd spirv-cross aria2
+          brew install --cask dotnet-sdk
+          python3 -m pip install --break-system-packages lz4 capstone fonttools
+
+      - name: Download NSP and Keys from Oracle Cloud
+        env:
+          NSP_URL: ${{ secrets.NSP_ARCHIVE_URL }}
+          KEYS_URL: ${{ secrets.KEYS_URL }}
+        run: |
+          mkdir -p ~/Games/TargetGame ~/keys
+          aria2c -x 16 -s 16 "$NSP_URL" -d ~/ -o nsp.zip
+          unzip -j ~/nsp.zip -d ~/Games/TargetGame
+          rm ~/nsp.zip
+          curl -fL "$KEYS_URL" -o ~/keys/prod.keys
+          ls -lh ~/Games/TargetGame ~/keys
+
+      - name: Build IPA from NSP
+        working-directory: ./nxnative
+        run: |
+          python3 scripts/build_ipa_from_nsp.py ~/Games/TargetGame -k ~/keys/prod.keys
+
+      - name: Upload Finished IPA Back to Oracle Cloud
+        env:
+          UPLOAD_URL: ${{ secrets.OCI_UPLOAD_URL }}
+        run: |
+          for ipa in ~/Games/TargetGame/*.ipa; do
+            filename=$(basename "$ipa")
+            echo "Uploading $filename to Oracle Cloud..."
+            curl -f -X PUT --upload-file "$ipa" "${UPLOAD_URL%/}/${filename}"
+          done
