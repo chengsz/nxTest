@@ -59,6 +59,9 @@ jobs:
       - name: Build IPA from NSP
         working-directory: ./nxnative
         run: |
+          # Force Xcode 16 for this exact script block to prevent the apple-a18 error
+          export DEVELOPER_DIR=$(find /Applications -maxdepth 1 -name "Xcode_16*.app" | sort -V | tail -n 1)/Contents/Developer
+          
           dotnet publish dm/gfx/tools/dmsh_xlate/dmsh_xlate.csproj -c Release -r osx-arm64 --self-contained -o dm/gfx/tools/dmsh_xlate_bin
 
           DM_GAME=${{ github.event.inputs.game_id }} python3 dm/gfx/tools/dmsh_chain.py --update-lock
