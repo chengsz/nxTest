@@ -59,8 +59,11 @@ jobs:
       - name: Build IPA from NSP
         working-directory: ./nxnative
         run: |
-          # Force Xcode 16 for this exact script block to prevent the apple-a18 error
+          # Force Xcode 16 for this exact script block
           export DEVELOPER_DIR=$(find /Applications -maxdepth 1 -name "Xcode_16*.app" | sort -V | tail -n 1)/Contents/Developer
+          
+          # Patch the Swift coding error by replacing .glassProminent with .regular
+          sed -i '' 's/\.glassProminent/.regular/g' dm/ios/Sources/Launcher.swift || true
           
           dotnet publish dm/gfx/tools/dmsh_xlate/dmsh_xlate.csproj -c Release -r osx-arm64 --self-contained -o dm/gfx/tools/dmsh_xlate_bin
 
