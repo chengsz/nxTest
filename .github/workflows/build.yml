@@ -28,7 +28,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: |
-            nxnative/dm/games/${{ github.event.inputs.game_id }}*_build
+            ~/Games/TargetGame/${{ github.event.inputs.game_id }}*_build
             ~/.nuget/packages
           key: nxnative-build-${{ github.event.inputs.game_id }}-${{ hashFiles('nxnative/dm/games/${{ github.event.inputs.game_id }}*') }}
           restore-keys: |
@@ -76,7 +76,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: |
-            nxnative/dm/games/${{ github.event.inputs.game_id }}*_build
+            ~/Games/TargetGame/${{ github.event.inputs.game_id }}*_build
             ~/.nuget/packages
           key: nxnative-build-${{ github.event.inputs.game_id }}-${{ github.run_id }}
 
