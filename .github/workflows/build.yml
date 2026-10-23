@@ -4,95 +4,192 @@ on:
   workflow_dispatch:
     inputs:
       game_id:
-        description: 'Game Title ID (e.g. 0100000000010000)'
-        required: true
+        description: 'Title ID (e.g. 0100000000010000; leave blank to auto-detect)'
+        required: false
         default: '0100000000010000'
+
+# Only one run at a time: NSP_ARCHIVE_URL points at one game, so parallel runs would be the same game
+concurrency:
+  group: nxnative-build
+  cancel-in-progress: false
 
 jobs:
   build-ipa:
-    runs-on: macos-15
-    timeout-minutes: 360
+    runs-on: macos-26          # Xcode 26: iOS 26 SDK (.glassProminent) + clang that knows A18
+    timeout-minutes: 360       # GitHub-hosted maximum
 
     steps:
-      - name: Maximize Runner Disk Space
+      - name: Select newest Xcode 26
         run: |
+          XCODE=$(find /Applications -maxdepth 1 -name 'Xcode_26*.app' | sort -V | tail -n 1)
+          XCODE=$(cd "$XCODE" && pwd -P)   # resolve symlinks to the real app
+          echo "Using $XCODE"
+          sudo xcode-select -s "$XCODE/Contents/Developer"
+          echo "KEEP_XCODE=$XCODE" >> "$GITHUB_ENV"
+          xcodebuild -version
+          clang --version
+
+      - name: Free disk space
+        run: |
+          df -h /
+          for x in /Applications/Xcode*.app; do
+            [ -L "$x" ] && continue
+            [ "$x" = "$KEEP_XCODE" ] && continue
+            echo "Removing $x"
+            sudo rm -rf "$x"
+          done
+          xcrun simctl runtime delete all || true
           sudo rm -rf /Library/Developer/CommandLineTools
           sudo rm -rf /Users/runner/Library/Android
           sudo rm -rf /Users/runner/hostedtoolcache
-          df -h
+          df -h /
 
-      - name: Clone nxnative
-        run: git clone https://github.com/seedds/nxnative.git
-
-      - name: Restore Cache (Shaders)
-        uses: actions/cache/restore@v4
+      - name: Checkout nxnative
+        uses: actions/checkout@v4
         with:
-          path: |
-            ~/Games/TargetGame/${{ github.event.inputs.game_id }}*_build
-            ~/.nuget/packages
-          key: nxnative-build-${{ github.event.inputs.game_id }}-${{ hashFiles('nxnative/dm/games/${{ github.event.inputs.game_id }}*') }}
-          restore-keys: |
-            nxnative-build-${{ github.event.inputs.game_id }}-
+          repository: seedds/nxnative
+          path: nxnative
+          submodules: recursive
 
-      - name: Install Homebrew & Python Dependencies
+      - name: Record nxnative commit
+        run: echo "NX_SHA=$(git -C nxnative rev-parse --short HEAD)" >> "$GITHUB_ENV"
+
+      - name: Install dependencies
         run: |
-          brew install xcodegen zstd spirv-cross aria2
-          brew install --cask dotnet-sdk
+          brew install xcodegen zstd spirv-cross aria2 sevenzip
+          brew cleanup --prune=all || true
           python3 -m pip install --break-system-packages lz4 capstone fonttools
+          dotnet --list-sdks
 
-      - name: Download NSP and Keys from Oracle Cloud
+      - name: Download and extract game
         env:
           NSP_URL: ${{ secrets.NSP_ARCHIVE_URL }}
+          INPUT_GAME_ID: ${{ inputs.game_id }}
+        run: |
+          set -euo pipefail
+          GAME_DIR=~/Games/TargetGame
+          mkdir -p "$GAME_DIR" ~/dl
+
+          aria2c -x 16 -s 16 --console-log-level=warn --summary-interval=0 \
+            "$NSP_URL" -d ~/dl -o download.bin
+          FILE=~/dl/download.bin
+
+          # Work out what was downloaded from the file's first bytes, not its name
+          MAGIC=$(head -c 4 "$FILE" | xxd -p)
+          case "$MAGIC" in
+            50465330)           NAME=game.nsp ;;   # "PFS0" = raw NSP
+            504b0304)           NAME=game.zip ;;
+            377abcaf)           NAME=game.7z  ;;
+            52617221)           NAME=game.rar ;;
+            *) echo "::error::Unrecognized download (first bytes: $MAGIC). Check NSP_ARCHIVE_URL."; exit 1 ;;
+          esac
+          echo "Downloaded: $NAME"
+
+          case "$NAME" in
+            game.nsp) mv "$FILE" "$GAME_DIR/game.nsp" ;;
+            *)        7zz e "$FILE" -o"$GAME_DIR" -y > /dev/null; rm -f "$FILE" ;;
+          esac
+          ls -lh "$GAME_DIR"
+
+          # Make sure there is at least one NSP
+          shopt -s nullglob nocaseglob
+          nsps=("$GAME_DIR"/*.nsp)
+          if [ ${#nsps[@]} -eq 0 ]; then
+            xcis=("$GAME_DIR"/*.xci)
+            if [ ${#xcis[@]} -gt 0 ]; then
+              echo "::error::Found an XCI but no NSP. Convert it to NSP first."
+            else
+              echo "::error::No NSP found in the download"
+            fi
+            exit 1
+          fi
+
+          # Title ID: use the input if given, otherwise detect it from file names
+          GAME_ID=$(echo "$INPUT_GAME_ID" | tr -d ' ')   # keep your typed case so old cache keys still match
+          if [ -z "$GAME_ID" ]; then
+            IDS=$(ls "$GAME_DIR" | grep -oiE '01[0-9a-f]{14}' | tr '[:lower:]' '[:upper:]' | sort -u || true)
+            GAME_ID=$(echo "$IDS" | grep '000$' | head -n 1 || true)          # prefer a base-game ID
+            if [ -z "$GAME_ID" ] && [ -n "$IDS" ]; then
+              FIRST=$(echo "$IDS" | head -n 1)
+              GAME_ID="$(echo "$FIRST" | cut -c1-13)000"                     # update ID -> base ID
+            fi
+          fi
+          if ! echo "$GAME_ID" | grep -qiE '^01[0-9a-f]{14}$'; then
+            echo "::error::Could not determine a valid Title ID. Enter it in the game_id field."
+            exit 1
+          fi
+          echo "Title ID: $GAME_ID"
+          echo "GAME_ID=$GAME_ID" >> "$GITHUB_ENV"
+
+          if ! ls -d nxnative/dm/games/"$GAME_ID"* > /dev/null 2>&1; then
+            echo "::warning::nxnative has no dm/games profile for $GAME_ID. This game may not be supported yet."
+          fi
+
+      - name: Download keys
+        env:
           KEYS_URL: ${{ secrets.KEYS_URL }}
         run: |
-          mkdir -p ~/Games/TargetGame ~/keys
-          aria2c -x 16 -s 16 "$NSP_URL" -d ~/ -o nsp.zip
-          unzip -j ~/nsp.zip -d ~/Games/TargetGame
-          rm ~/nsp.zip
-          curl -fL "$KEYS_URL" -o ~/keys/prod.keys
+          mkdir -p ~/keys
+          curl -fsSL "$KEYS_URL" -o ~/keys/prod.keys
 
-      - name: Select Latest Xcode 16
-        run: |
-          sudo xcode-select -s $(find /Applications -maxdepth 1 -name "Xcode_16*.app" | sort -V | tail -n 1)/Contents/Developer
-          clang --version
+      - name: Restore shader/build cache
+        uses: actions/cache/restore@v4
+        with:
+          # Same paths as the old workflow, so its existing caches stay compatible
+          path: |
+            ~/Games/TargetGame/${{ env.GAME_ID }}*_build
+            ~/.nuget/packages
+          key: nxnative-build-${{ env.GAME_ID }}-${{ env.NX_SHA }}-${{ github.run_id }}
+          restore-keys: |
+            nxnative-build-${{ env.GAME_ID }}-${{ env.NX_SHA }}-
+            nxnative-build-${{ env.GAME_ID }}-
 
-      - name: Build IPA from NSP
+      - name: Build IPA
         working-directory: ./nxnative
+        timeout-minutes: 300   # stop before the job limit so the cache still gets saved
         run: |
-          # Force Xcode 16 for this exact script block
-          export DEVELOPER_DIR=$(find /Applications -maxdepth 1 -name "Xcode_16*.app" | sort -V | tail -n 1)/Contents/Developer
-          
-          # Patch the Swift coding error by replacing .glassProminent with .regular
-          sed -i '' 's/\.glassProminent/.regular/g' dm/ios/Sources/Launcher.swift || true
-          
-          dotnet publish dm/gfx/tools/dmsh_xlate/dmsh_xlate.csproj -c Release -r osx-arm64 --self-contained -o dm/gfx/tools/dmsh_xlate_bin
+          set -euo pipefail
+          df -h /
 
-          DM_GAME=${{ github.event.inputs.game_id }} python3 dm/gfx/tools/dmsh_chain.py --update-lock
-          for g in dm/games/0100*; do
-            if [ -d "$g" ]; then
-              DM_GAME=$(basename "$g") python3 dm/gfx/tools/dmsh_chain.py --update-lock
-              DM_GAME=$(basename "$g") python3 dm/gfx/tools/dmsh_chain.py --header || true
-            fi
-          done
+          dotnet publish dm/gfx/tools/dmsh_xlate/dmsh_xlate.csproj \
+            -c Release -r osx-arm64 --self-contained \
+            -o dm/gfx/tools/dmsh_xlate_bin
+
+          DM_GAME="$GAME_ID" python3 dm/gfx/tools/dmsh_chain.py --update-lock
+          DM_GAME="$GAME_ID" python3 dm/gfx/tools/dmsh_chain.py --header \
+            || echo "::warning::dmsh_chain --header failed for $GAME_ID"
 
           python3 scripts/build_ipa_from_nsp.py ~/Games/TargetGame -k ~/keys/prod.keys
 
-      - name: Force Save Cache
-        if: always()
+      - name: Save shader/build cache
+        if: always() && env.GAME_ID != ''
+        continue-on-error: true   # don't fail the run if there was nothing to cache yet
         uses: actions/cache/save@v4
         with:
+          # Same paths as the old workflow, so its existing caches stay compatible
           path: |
-            ~/Games/TargetGame/${{ github.event.inputs.game_id }}*_build
+            ~/Games/TargetGame/${{ env.GAME_ID }}*_build
             ~/.nuget/packages
-          key: nxnative-build-${{ github.event.inputs.game_id }}-${{ github.run_id }}
+          key: nxnative-build-${{ env.GAME_ID }}-${{ env.NX_SHA }}-${{ github.run_id }}
 
-      - name: Upload Finished IPA Back to Oracle Cloud
+      - name: Upload IPA to Oracle Cloud
         if: success()
         env:
           UPLOAD_URL: ${{ secrets.OCI_UPLOAD_URL }}
         run: |
-          for ipa in ~/Games/TargetGame/*.ipa; do
-            filename=$(basename "$ipa")
-            echo "Uploading $filename to Oracle Cloud..."
-            curl -f -X PUT --upload-file "$ipa" "${UPLOAD_URL%/}/${filename}"
+          shopt -s nullglob
+          ipas=(~/Games/TargetGame/*.ipa)
+          if [ ${#ipas[@]} -eq 0 ]; then
+            echo "::error::No IPA was produced"
+            exit 1
+          fi
+          for ipa in "${ipas[@]}"; do
+            NAME=$(basename "$ipa")
+            ENC=$(python3 -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.argv[1]))' "$NAME")
+            echo "Uploading $NAME to $GAME_ID/"
+            curl -f -X PUT --upload-file "$ipa" "${UPLOAD_URL%/}/$GAME_ID/$ENC"
           done
+
+      - name: Remove keys
+        if: always()
+        run: rm -rf ~/keys
