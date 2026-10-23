@@ -38,10 +38,22 @@ jobs:
             echo "Removing $x"
             sudo rm -rf "$x"
           done
-          xcrun simctl runtime delete all || true
+          # Do NOT delete simulator runtimes: Xcode 26 needs the iOS platform even for a device build
           sudo rm -rf /Library/Developer/CommandLineTools
           sudo rm -rf /Users/runner/Library/Android
           sudo rm -rf /Users/runner/hostedtoolcache
+          df -h /
+
+      - name: Make sure the iOS platform is installed
+        run: |
+          SDK_VER=$(xcrun --sdk iphoneos --show-sdk-version)
+          echo "iOS SDK: $SDK_VER"
+          if xcrun simctl list runtimes | grep -q "iOS $SDK_VER"; then
+            echo "iOS $SDK_VER platform is installed"
+          else
+            echo "iOS $SDK_VER platform missing - downloading it (this can take a while)"
+            xcodebuild -downloadPlatform iOS
+          fi
           df -h /
 
       - name: Checkout nxnative
