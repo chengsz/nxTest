@@ -11,6 +11,13 @@ on:
           - last-success    # newest save from a run that produced an IPA
           - none            # start clean
         default: latest
+      romfs:
+        description: 'Game data: separate romfs.img (small IPA) or inside the IPA'
+        type: choice
+        options:
+          - separate
+          - inside
+        default: separate
       extra_args:
         description: 'Extra build_ipa_from_nsp.py options (optional, e.g. --no-heap-check, --survey-only)'
         required: false
@@ -170,13 +177,16 @@ jobs:
         timeout-minutes: 300   # stop before the job limit so the cache still gets saved
         env:
           EXTRA_ARGS: ${{ inputs.extra_args }}
+          ROMFS_MODE: ${{ inputs.romfs }}
         run: |
           set -euo pipefail
           df -h /
+          ROMFS_ARGS=""
+          [ "$ROMFS_MODE" = "separate" ] && ROMFS_ARGS="--romfs separate"
           # nxnative finds the Title ID itself (ticket, file name or metadata).
           # It uses the repo's prebuilt shader translator as-is.
           # shellcheck disable=SC2086
-          python3 scripts/build_ipa_from_nsp.py ~/Games/TargetGame -k ~/keys/prod.keys $EXTRA_ARGS
+          python3 scripts/build_ipa_from_nsp.py ~/Games/TargetGame -k ~/keys/prod.keys $ROMFS_ARGS $EXTRA_ARGS
 
       - name: Detected Title ID and survey
         if: always()
@@ -222,6 +232,7 @@ jobs:
         if: success()
         env:
           UPLOAD_URL: ${{ secrets.OCI_UPLOAD_URL }}
+          ROMFS_MODE: ${{ inputs.romfs }}
         run: |
           shopt -s nullglob
           ipas=(~/Games/TargetGame/*.ipa)
@@ -233,9 +244,22 @@ jobs:
           for ipa in "${ipas[@]}"; do
             NAME=$(basename "$ipa")
             ENC=$(python3 -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.argv[1]))' "$NAME")
+            ls -lh "$ipa"
             echo "Uploading $NAME to $FOLDER/"
             curl -f -X PUT --upload-file "$ipa" "${UPLOAD_URL%/}/$FOLDER/$ENC"
           done
+
+          # With --romfs separate the game data is a separate image: upload it as romfs.img
+          if [ "$ROMFS_MODE" = "separate" ]; then
+            IMG=$(find ~/Games/TargetGame -type f -iname 'romfs.img' -exec ls -s {} + 2>/dev/null | sort -n | tail -n 1 | awk '{print $2}')
+            if [ -n "$IMG" ]; then
+              ls -lh "$IMG"
+              echo "Uploading $IMG as $FOLDER/romfs.img"
+              curl -f -X PUT --upload-file "$IMG" "${UPLOAD_URL%/}/$FOLDER/romfs.img"
+            else
+              echo "::warning::Built with --romfs separate but no romfs.img was found to upload"
+            fi
+          fi
 
       - name: Remove keys
         if: always()
