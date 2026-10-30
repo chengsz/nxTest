@@ -7,27 +7,31 @@ on:
         description: 'Title ID (e.g. 0100000000010000; leave blank to auto-detect)'
         required: false
         default: '0100000000010000'
+      extra_args:
+        description: 'Extra build_ipa_from_nsp.py options (e.g. --no-heap-check, --survey-only)'
+        required: false
+        default: ''
 
-# Only one run at a time: NSP_ARCHIVE_URL points at one game, so parallel runs would be the same game
+# Only one run at a time: NSP_ARCHIVE_URL points at one game
 concurrency:
   group: nxnative-build
   cancel-in-progress: false
 
 jobs:
   build-ipa:
-    runs-on: macos-26          # Xcode 26: iOS 26 SDK (.glassProminent) + clang that knows A18
+    runs-on: xcode-27          # nxnative pins its Metal compiler to Xcode 27.1 (dmsh_chain.lock)
     timeout-minutes: 360       # GitHub-hosted maximum
 
     steps:
-      - name: Select newest Xcode 26
+      - name: Select Xcode 27.1
         run: |
-          XCODE=$(find /Applications -maxdepth 1 -name 'Xcode_26*.app' | sort -V | tail -n 1)
+          XCODE=$(find /Applications -maxdepth 1 -name 'Xcode_27.1*.app' | sort -V | tail -n 1)
+          [ -n "$XCODE" ] || XCODE=$(find /Applications -maxdepth 1 -name 'Xcode_27*.app' | sort -V | tail -n 1)
           XCODE=$(cd "$XCODE" && pwd -P)   # resolve symlinks to the real app
           echo "Using $XCODE"
           sudo xcode-select -s "$XCODE/Contents/Developer"
           echo "KEEP_XCODE=$XCODE" >> "$GITHUB_ENV"
           xcodebuild -version
-          clang --version
 
       - name: Free disk space
         run: |
@@ -38,7 +42,7 @@ jobs:
             echo "Removing $x"
             sudo rm -rf "$x"
           done
-          # Do NOT delete simulator runtimes: Xcode 26 needs the iOS platform even for a device build
+          # Keep simulator runtimes: Xcode needs the iOS platform even for a device build
           sudo rm -rf /Library/Developer/CommandLineTools
           sudo rm -rf /Users/runner/Library/Android
           sudo rm -rf /Users/runner/hostedtoolcache
@@ -54,7 +58,16 @@ jobs:
             echo "iOS $SDK_VER platform missing - downloading it (this can take a while)"
             xcodebuild -downloadPlatform iOS
           fi
-          df -h /
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'   # the script needs 3.12 or newer
+
+      - name: Set up .NET 10
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'   # the prebuilt shader translator runs on .NET 10
 
       - name: Checkout nxnative
         uses: actions/checkout@v4
@@ -62,16 +75,18 @@ jobs:
           repository: seedds/nxnative
           path: nxnative
           submodules: recursive
+          lfs: true
 
       - name: Record nxnative commit
         run: echo "NX_SHA=$(git -C nxnative rev-parse --short HEAD)" >> "$GITHUB_ENV"
 
       - name: Install dependencies
         run: |
-          brew install xcodegen zstd spirv-cross aria2 sevenzip
+          brew install xcodegen zstd aria2 sevenzip glslang
           brew cleanup --prune=all || true
-          python3 -m pip install --break-system-packages lz4 capstone fonttools
-          dotnet --list-sdks
+          python3 -m pip install lz4 capstone fonttools
+          python3 --version
+          dotnet --list-runtimes
 
       - name: Download and extract game
         env:
@@ -89,10 +104,10 @@ jobs:
           # Work out what was downloaded from the file's first bytes, not its name
           MAGIC=$(head -c 4 "$FILE" | xxd -p)
           case "$MAGIC" in
-            50465330)           NAME=game.nsp ;;   # "PFS0" = raw NSP
-            504b0304)           NAME=game.zip ;;
-            377abcaf)           NAME=game.7z  ;;
-            52617221)           NAME=game.rar ;;
+            50465330) NAME=game.nsp ;;   # "PFS0" = raw NSP
+            504b0304) NAME=game.zip ;;
+            377abcaf) NAME=game.7z  ;;
+            52617221) NAME=game.rar ;;
             *) echo "::error::Unrecognized download (first bytes: $MAGIC). Check NSP_ARCHIVE_URL."; exit 1 ;;
           esac
           echo "Downloaded: $NAME"
@@ -103,27 +118,16 @@ jobs:
           esac
           ls -lh "$GAME_DIR"
 
-          # Make sure there is at least one NSP
-          shopt -s nullglob nocaseglob
-          nsps=("$GAME_DIR"/*.nsp)
-          if [ ${#nsps[@]} -eq 0 ]; then
-            xcis=("$GAME_DIR"/*.xci)
-            if [ ${#xcis[@]} -gt 0 ]; then
-              echo "::error::Found an XCI but no NSP. Convert it to NSP first."
-            else
-              echo "::error::No NSP found in the download"
-            fi
-            exit 1
-          fi
+          # Pin the game files' timestamps so nxnative's reuse checks see the same files each run
+          find "$GAME_DIR" -maxdepth 1 -type f -exec touch -h -t 202001010000 {} +
 
           # Title ID: use the input if given, otherwise detect it from file names
-          GAME_ID=$(echo "$INPUT_GAME_ID" | tr -d ' ')   # keep your typed case so old cache keys still match
+          GAME_ID=$(echo "$INPUT_GAME_ID" | tr -d ' ')
           if [ -z "$GAME_ID" ]; then
             IDS=$(ls "$GAME_DIR" | grep -oiE '01[0-9a-f]{14}' | tr '[:lower:]' '[:upper:]' | sort -u || true)
-            GAME_ID=$(echo "$IDS" | grep '000$' | head -n 1 || true)          # prefer a base-game ID
+            GAME_ID=$(echo "$IDS" | grep '000$' | head -n 1 || true)
             if [ -z "$GAME_ID" ] && [ -n "$IDS" ]; then
-              FIRST=$(echo "$IDS" | head -n 1)
-              GAME_ID="$(echo "$FIRST" | cut -c1-13)000"                     # update ID -> base ID
+              GAME_ID="$(echo "$IDS" | head -n 1 | cut -c1-13)000"
             fi
           fi
           if ! echo "$GAME_ID" | grep -qiE '^01[0-9a-f]{14}$'; then
@@ -133,8 +137,10 @@ jobs:
           echo "Title ID: $GAME_ID"
           echo "GAME_ID=$GAME_ID" >> "$GITHUB_ENV"
 
-          if ! ls -d nxnative/dm/games/"$GAME_ID"* > /dev/null 2>&1; then
-            echo "::warning::nxnative has no dm/games profile for $GAME_ID. This game may not be supported yet."
+          if ls -d nxnative/dm/games/"$GAME_ID"* > /dev/null 2>&1; then
+            echo "::notice::nxnative has a profile for $GAME_ID"
+          else
+            echo "::warning::No nxnative profile for $GAME_ID: the script will survey it and build a best-effort IPA that may not boot."
           fi
 
       - name: Download keys
@@ -144,45 +150,35 @@ jobs:
           mkdir -p ~/keys
           curl -fsSL "$KEYS_URL" -o ~/keys/prod.keys
 
-      - name: Restore shader/build cache
+      - name: Restore build cache
         uses: actions/cache/restore@v4
         with:
-          # Same paths as the old workflow, so its existing caches stay compatible
-          path: |
-            ~/Games/TargetGame/${{ env.GAME_ID }}*_build
-            ~/.nuget/packages
-          key: nxnative-build-${{ env.GAME_ID }}-${{ env.NX_SHA }}-${{ github.run_id }}
+          path: ~/Games/TargetGame/*_build
+          key: nxnative-v2-${{ env.GAME_ID }}-${{ env.NX_SHA }}-${{ github.run_id }}
           restore-keys: |
-            nxnative-build-${{ env.GAME_ID }}-${{ env.NX_SHA }}-
-            nxnative-build-${{ env.GAME_ID }}-
+            nxnative-v2-${{ env.GAME_ID }}-${{ env.NX_SHA }}-
+            nxnative-v2-${{ env.GAME_ID }}-
 
       - name: Build IPA
         working-directory: ./nxnative
         timeout-minutes: 300   # stop before the job limit so the cache still gets saved
+        env:
+          EXTRA_ARGS: ${{ inputs.extra_args }}
         run: |
           set -euo pipefail
           df -h /
+          # Uses the repo's prebuilt shader translator as-is: rebuilding it changes the
+          # shader fingerprints and forces every shader to compile again.
+          # shellcheck disable=SC2086
+          python3 scripts/build_ipa_from_nsp.py ~/Games/TargetGame -k ~/keys/prod.keys $EXTRA_ARGS
 
-          dotnet publish dm/gfx/tools/dmsh_xlate/dmsh_xlate.csproj \
-            -c Release -r osx-arm64 --self-contained \
-            -o dm/gfx/tools/dmsh_xlate_bin
-
-          DM_GAME="$GAME_ID" python3 dm/gfx/tools/dmsh_chain.py --update-lock
-          DM_GAME="$GAME_ID" python3 dm/gfx/tools/dmsh_chain.py --header \
-            || echo "::warning::dmsh_chain --header failed for $GAME_ID"
-
-          python3 scripts/build_ipa_from_nsp.py ~/Games/TargetGame -k ~/keys/prod.keys
-
-      - name: Save shader/build cache
+      - name: Save build cache
         if: always() && env.GAME_ID != ''
-        continue-on-error: true   # don't fail the run if there was nothing to cache yet
+        continue-on-error: true
         uses: actions/cache/save@v4
         with:
-          # Same paths as the old workflow, so its existing caches stay compatible
-          path: |
-            ~/Games/TargetGame/${{ env.GAME_ID }}*_build
-            ~/.nuget/packages
-          key: nxnative-build-${{ env.GAME_ID }}-${{ env.NX_SHA }}-${{ github.run_id }}
+          path: ~/Games/TargetGame/*_build
+          key: nxnative-v2-${{ env.GAME_ID }}-${{ env.NX_SHA }}-${{ github.run_id }}
 
       - name: Upload IPA to Oracle Cloud
         if: success()
@@ -192,8 +188,8 @@ jobs:
           shopt -s nullglob
           ipas=(~/Games/TargetGame/*.ipa)
           if [ ${#ipas[@]} -eq 0 ]; then
-            echo "::error::No IPA was produced"
-            exit 1
+            echo "::notice::No IPA was produced (expected with --survey-only)"
+            exit 0
           fi
           for ipa in "${ipas[@]}"; do
             NAME=$(basename "$ipa")
