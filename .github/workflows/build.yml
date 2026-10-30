@@ -3,12 +3,16 @@ name: Build nxnative IPA
 on:
   workflow_dispatch:
     inputs:
-      game_id:
-        description: 'Title ID (e.g. 0100000000010000; leave blank to auto-detect)'
-        required: false
-        default: '0100000000010000'
+      cache:
+        description: 'Which saved build to start from'
+        type: choice
+        options:
+          - latest          # newest save, even from a failed run (keeps partial shader progress)
+          - last-success    # newest save from a run that produced an IPA
+          - none            # start clean
+        default: latest
       extra_args:
-        description: 'Extra build_ipa_from_nsp.py options (e.g. --no-heap-check, --survey-only)'
+        description: 'Extra build_ipa_from_nsp.py options (optional, e.g. --no-heap-check, --survey-only)'
         required: false
         default: ''
 
@@ -27,7 +31,7 @@ jobs:
         run: |
           XCODE=$(find /Applications -maxdepth 1 -name 'Xcode_27.1*.app' | sort -V | tail -n 1)
           [ -n "$XCODE" ] || XCODE=$(find /Applications -maxdepth 1 -name 'Xcode_27*.app' | sort -V | tail -n 1)
-          XCODE=$(cd "$XCODE" && pwd -P)   # resolve symlinks to the real app
+          XCODE=$(cd "$XCODE" && pwd -P)
           echo "Using $XCODE"
           sudo xcode-select -s "$XCODE/Contents/Developer"
           echo "KEEP_XCODE=$XCODE" >> "$GITHUB_ENV"
@@ -62,12 +66,12 @@ jobs:
       - name: Set up Python 3.13
         uses: actions/setup-python@v5
         with:
-          python-version: '3.13'   # the script needs 3.12 or newer
+          python-version: '3.13'
 
       - name: Set up .NET 10
         uses: actions/setup-dotnet@v4
         with:
-          dotnet-version: '10.0.x'   # the prebuilt shader translator runs on .NET 10
+          dotnet-version: '10.0.x'
 
       - name: Checkout nxnative
         uses: actions/checkout@v4
@@ -84,14 +88,13 @@ jobs:
         run: |
           brew install xcodegen zstd aria2 sevenzip glslang
           brew cleanup --prune=all || true
-          python3 -m pip install lz4 capstone fonttools
+          python3 -m pip install lz4 "capstone>=5,<6" fonttools backports.zstd
           python3 --version
           dotnet --list-runtimes
 
       - name: Download and extract game
         env:
           NSP_URL: ${{ secrets.NSP_ARCHIVE_URL }}
-          INPUT_GAME_ID: ${{ inputs.game_id }}
         run: |
           set -euo pipefail
           GAME_DIR=~/Games/TargetGame
@@ -101,47 +104,36 @@ jobs:
             "$NSP_URL" -d ~/dl -o download.bin
           FILE=~/dl/download.bin
 
-          # Work out what was downloaded from the file's first bytes, not its name
+          # Identify the download by its contents, not its name
           MAGIC=$(head -c 4 "$FILE" | xxd -p)
+          XCI_MAGIC=$(dd if="$FILE" bs=1 skip=256 count=4 2>/dev/null | xxd -p)
           case "$MAGIC" in
-            50465330) NAME=game.nsp ;;   # "PFS0" = raw NSP
+            50465330) NAME=game.nsp ;;   # "PFS0": NSP (or NSZ)
             504b0304) NAME=game.zip ;;
             377abcaf) NAME=game.7z  ;;
             52617221) NAME=game.rar ;;
-            *) echo "::error::Unrecognized download (first bytes: $MAGIC). Check NSP_ARCHIVE_URL."; exit 1 ;;
+            *) if [ "$XCI_MAGIC" = "48454144" ]; then NAME=game.xci   # "HEAD" at 0x100
+               else echo "::error::Unrecognized download (first bytes: $MAGIC). Check NSP_ARCHIVE_URL."; exit 1; fi ;;
           esac
           echo "Downloaded: $NAME"
-
           case "$NAME" in
-            game.nsp) mv "$FILE" "$GAME_DIR/game.nsp" ;;
-            *)        7zz e "$FILE" -o"$GAME_DIR" -y > /dev/null; rm -f "$FILE" ;;
+            game.nsp|game.xci) mv "$FILE" "$GAME_DIR/$NAME" ;;
+            *) 7zz e "$FILE" -o"$GAME_DIR" -y > /dev/null; rm -f "$FILE" ;;
           esac
           ls -lh "$GAME_DIR"
 
-          # Pin the game files' timestamps so nxnative's reuse checks see the same files each run
+          # Pin timestamps so nxnative's reuse checks see the same files every run
           find "$GAME_DIR" -maxdepth 1 -type f -exec touch -h -t 202001010000 {} +
 
-          # Title ID: use the input if given, otherwise detect it from file names
-          GAME_ID=$(echo "$INPUT_GAME_ID" | tr -d ' ')
-          if [ -z "$GAME_ID" ]; then
-            IDS=$(ls "$GAME_DIR" | grep -oiE '01[0-9a-f]{14}' | tr '[:lower:]' '[:upper:]' | sort -u || true)
-            GAME_ID=$(echo "$IDS" | grep '000$' | head -n 1 || true)
-            if [ -z "$GAME_ID" ] && [ -n "$IDS" ]; then
-              GAME_ID="$(echo "$IDS" | head -n 1 | cut -c1-13)000"
-            fi
-          fi
-          if ! echo "$GAME_ID" | grep -qiE '^01[0-9a-f]{14}$'; then
-            echo "::error::Could not determine a valid Title ID. Enter it in the game_id field."
+          # A fingerprint of the game files (their sizes) names the cache, so no Title ID is needed
+          FP=$(find "$GAME_DIR" -maxdepth 1 -type f \( -iname '*.nsp' -o -iname '*.nsz' -o -iname '*.xci' -o -iname '*.xcz' \) \
+                 -exec stat -f '%z' {} + | sort -n | shasum -a 256 | cut -c1-12)
+          if [ -z "$FP" ] || [ "$FP" = "$(printf '' | shasum -a 256 | cut -c1-12)" ]; then
+            echo "::error::No NSP, NSZ, XCI or XCZ found in the download"
             exit 1
           fi
-          echo "Title ID: $GAME_ID"
-          echo "GAME_ID=$GAME_ID" >> "$GITHUB_ENV"
-
-          if ls -d nxnative/dm/games/"$GAME_ID"* > /dev/null 2>&1; then
-            echo "::notice::nxnative has a profile for $GAME_ID"
-          else
-            echo "::warning::No nxnative profile for $GAME_ID: the script will survey it and build a best-effort IPA that may not boot."
-          fi
+          echo "Game fingerprint: $FP"
+          echo "GAME_FP=$FP" >> "$GITHUB_ENV"
 
       - name: Download keys
         env:
@@ -150,14 +142,28 @@ jobs:
           mkdir -p ~/keys
           curl -fsSL "$KEYS_URL" -o ~/keys/prod.keys
 
-      - name: Restore build cache
+      - name: Restore build cache (latest)
+        if: inputs.cache == 'latest'
         uses: actions/cache/restore@v4
         with:
-          path: ~/Games/TargetGame/*_build
-          key: nxnative-v2-${{ env.GAME_ID }}-${{ env.NX_SHA }}-${{ github.run_id }}
+          path: |
+            ~/Games/TargetGame/*_build
+            !~/Games/TargetGame/*_build/extract
+          key: nxnative-v4-${{ env.GAME_FP }}-${{ env.NX_SHA }}-${{ github.run_id }}
           restore-keys: |
-            nxnative-v2-${{ env.GAME_ID }}-${{ env.NX_SHA }}-
-            nxnative-v2-${{ env.GAME_ID }}-
+            nxnative-v4-${{ env.GAME_FP }}-${{ env.NX_SHA }}-
+            nxnative-v4-${{ env.GAME_FP }}-
+
+      - name: Restore build cache (last success)
+        if: inputs.cache == 'last-success'
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/Games/TargetGame/*_build
+            !~/Games/TargetGame/*_build/extract
+          key: nxnative-good-v4-${{ env.GAME_FP }}-${{ github.run_id }}
+          restore-keys: |
+            nxnative-good-v4-${{ env.GAME_FP }}-
 
       - name: Build IPA
         working-directory: ./nxnative
@@ -167,18 +173,50 @@ jobs:
         run: |
           set -euo pipefail
           df -h /
-          # Uses the repo's prebuilt shader translator as-is: rebuilding it changes the
-          # shader fingerprints and forces every shader to compile again.
+          # nxnative finds the Title ID itself (ticket, file name or metadata).
+          # It uses the repo's prebuilt shader translator as-is.
           # shellcheck disable=SC2086
           python3 scripts/build_ipa_from_nsp.py ~/Games/TargetGame -k ~/keys/prod.keys $EXTRA_ARGS
 
-      - name: Save build cache
-        if: always() && env.GAME_ID != ''
+      - name: Detected Title ID and survey
+        if: always()
+        run: |
+          shopt -s nullglob
+          dirs=(~/Games/TargetGame/*_build)
+          if [ ${#dirs[@]} -gt 0 ]; then
+            ID=$(basename "${dirs[0]}" _build)
+            echo "Title ID detected by nxnative: $ID"
+            echo "GAME_ID=$ID" >> "$GITHUB_ENV"
+            if ls -d nxnative/dm/games/"$ID"* > /dev/null 2>&1; then
+              echo "::notice::$ID has an nxnative profile"
+            else
+              echo "::warning::$ID has no nxnative profile: best-effort build that may not boot"
+            fi
+          fi
+          for f in ~/Games/TargetGame/*_survey/survey.md; do
+            echo "===== $f ====="
+            cat "$f"
+          done
+
+      - name: Save build cache (latest, every run)
+        if: always() && env.GAME_FP != ''
         continue-on-error: true
         uses: actions/cache/save@v4
         with:
-          path: ~/Games/TargetGame/*_build
-          key: nxnative-v2-${{ env.GAME_ID }}-${{ env.NX_SHA }}-${{ github.run_id }}
+          path: |
+            ~/Games/TargetGame/*_build
+            !~/Games/TargetGame/*_build/extract
+          key: nxnative-v4-${{ env.GAME_FP }}-${{ env.NX_SHA }}-${{ github.run_id }}
+
+      - name: Save build cache (known good)
+        if: success()
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/Games/TargetGame/*_build
+            !~/Games/TargetGame/*_build/extract
+          key: nxnative-good-v4-${{ env.GAME_FP }}-${{ github.run_id }}
 
       - name: Upload IPA to Oracle Cloud
         if: success()
@@ -191,11 +229,12 @@ jobs:
             echo "::notice::No IPA was produced (expected with --survey-only)"
             exit 0
           fi
+          FOLDER="${GAME_ID:-unknown}"
           for ipa in "${ipas[@]}"; do
             NAME=$(basename "$ipa")
             ENC=$(python3 -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.argv[1]))' "$NAME")
-            echo "Uploading $NAME to $GAME_ID/"
-            curl -f -X PUT --upload-file "$ipa" "${UPLOAD_URL%/}/$GAME_ID/$ENC"
+            echo "Uploading $NAME to $FOLDER/"
+            curl -f -X PUT --upload-file "$ipa" "${UPLOAD_URL%/}/$FOLDER/$ENC"
           done
 
       - name: Remove keys
