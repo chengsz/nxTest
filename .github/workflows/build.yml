@@ -18,6 +18,10 @@ on:
           - separate
           - inside
         default: separate
+      xcode_version:
+        description: 'Xcode to use, e.g. 27.2 (blank = newest released 27.x on the runner)'
+        required: false
+        default: ''
       extra_args:
         description: 'Extra build_ipa_from_nsp.py options (optional, e.g. --no-heap-check, --survey-only)'
         required: false
@@ -30,14 +34,26 @@ concurrency:
 
 jobs:
   build-ipa:
-    runs-on: xcode-27          # nxnative pins its Metal compiler to Xcode 27.1 (dmsh_chain.lock)
+    runs-on: xcode-27          # nxnative pins its Metal compiler to a specific Xcode 27.x (dmsh_chain.lock)
     timeout-minutes: 360       # GitHub-hosted maximum
 
     steps:
-      - name: Select Xcode 27.1
+      - name: Select Xcode
+        env:
+          WANT: ${{ inputs.xcode_version }}
         run: |
-          XCODE=$(find /Applications -maxdepth 1 -name 'Xcode_27.1*.app' | sort -V | tail -n 1)
-          [ -n "$XCODE" ] || XCODE=$(find /Applications -maxdepth 1 -name 'Xcode_27*.app' | sort -V | tail -n 1)
+          echo "Xcode versions on this runner:"
+          ls -d /Applications/Xcode*.app
+          if [ -n "$WANT" ]; then
+            XCODE=$(find /Applications -maxdepth 1 -name "Xcode_${WANT}*.app" | sort -V | tail -n 1)
+          else
+            # nxnative pins its Metal compiler to a specific Xcode (dmsh_chain.lock); use the newest released 27.x
+            XCODE=$(find /Applications -maxdepth 1 -name 'Xcode_27*.app' ! -iname '*beta*' ! -iname '*_RC*' | sort -V | tail -n 1)
+          fi
+          if [ -z "$XCODE" ]; then
+            echo "::error::Xcode ${WANT:-27.x} is not installed on this runner image"
+            exit 1
+          fi
           XCODE=$(cd "$XCODE" && pwd -P)
           echo "Using $XCODE"
           sudo xcode-select -s "$XCODE/Contents/Developer"
@@ -68,6 +84,16 @@ jobs:
           else
             echo "iOS $SDK_VER platform missing - downloading it (this can take a while)"
             xcodebuild -downloadPlatform iOS
+          fi
+
+      - name: Make sure the Metal toolchain is installed
+        run: |
+          if xcrun -sdk iphoneos metal --version; then
+            echo "Metal toolchain is installed"
+          else
+            echo "Metal toolchain missing - downloading it"
+            xcodebuild -downloadComponent MetalToolchain
+            xcrun -sdk iphoneos metal --version
           fi
 
       - name: Set up Python 3.13
